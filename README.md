@@ -30,23 +30,28 @@ Preloader 用 CERT1 + CERT2 两级证书验证启动镜像。CERT2 内含两个 
 
 ## 启动链与 Patch 策略
 
-### V5（无 bl2_ext 分区）
+### V5（无 bl2_ext，如 MT6833）
 
 ```
 BootROM → Preloader → LK (cert bypass) → Kernel
                     → ATF/TEE (cert bypass)
 ```
 
-只需 patch 和 cert bypass 签名 LK 和（可选的）ATF。Preloader 直接验证，无中间层。
+Preloader 直接用 CERT1/CERT2 验证 LK 和 ATF。cert bypass 直接绕过，不需要额外 patch。
 
-### V6（有 bl2_ext 分区）
+### V6（有 bl2_ext）
 
 ```
-BootROM → Preloader → bl2_ext (cert bypass) → LK (需先 patch bl2_ext 去验证)
-                                             → ATF/TEE (同上)
+BootROM → Preloader → bl2_ext (cert bypass) → LK (bl2_ext 二次验证)
+                                             → ATF/TEE (bl2_ext 二次验证)
 ```
 
-bl2_ext 有独立验证逻辑。必须先 patch bl2_ext 去除它对 LK/ATF 的验证调用，再 cert bypass 签名 bl2_ext 本身。否则修改过的 LK/ATF 仍被拒绝。
+bl2_ext 内部有独立的签名验证逻辑，会二次验证 LK/ATF。流程：
+1. Patch bl2_ext 去掉它对 LK/ATF 的验证调用（NOP 掉校验函数）
+2. cert bypass 签名 bl2_ext 本身（让 preloader 接受修改后的 bl2_ext）
+3. cert bypass 签名修改后的 LK/ATF
+
+**判断方法：** 用 `parse_preloader.py` 查看分区策略表，有 `bl2_ext` 条目就是 V6，没有就是 V5。
 
 ---
 
@@ -201,7 +206,7 @@ python3 parse_preloader.py preloader.bin
 ## 注意事项
 
 1. **备份原始镜像**。错误的 patch 可能导致硬砖（需 BROM 模式救砖）
-2. **镜像大小**。cert bypass 会增大 CERT2 的 dsize。确保最终镜像不超出分区容量
+2. **镜像大小**。cert bypass 会增大 CERT2 的 dsize，脚本会自动截断尾部零填充保持原始大小。如果尾部无零填充会发出警告
 3. **漏洞时效性**。此漏洞可能在新版 preloader 中已修复。如果 CERT2 bypass 失败，可能说明设备已更新
-4. **V6 设备额外步骤**。必须先 patch bl2_ext 去除二次验证，否则只 bypass CERT2 无效
-5. **Preloader 本身**。修改 preloader 需要 Image Key 私钥做 PSS 重签名，目前未破解。cert bypass 只适用于 preloader 验证的下游镜像（LK/ATF/TEE/GZ）
+4. **V6 设备**。有 bl2_ext 的设备需要额外 patch bl2_ext 去除二次验证。用 `parse_preloader.py` 确认是否有 bl2_ext
+5. **Preloader 本身**。修改 preloader 需要 Image Key 私钥做 PSS 重签名。cert bypass 只适用于 preloader 验证的下游镜像（LK/ATF/TEE/GZ）
