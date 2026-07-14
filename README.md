@@ -1,68 +1,207 @@
 # pwnage24mtk
-Cert exploit for MTK devices.There is a logic flaw in MTK cert verification process.Similar to CVE-2023-20696.
-May be patched at June 
 
-# Disclaimer
-This project is only used for researching.
-Make sure you get authorized before you use it.
-Not allowed for illegal use.
-It is not allowed to use this exploit to provide paid services.
+MediaTek 安全启动 CERT2 哈希覆盖工具集。利用 preloader 中 ASN.1 解析逻辑缺陷，在不破坏 CERT2 签名的前提下替换镜像哈希，使修改过的 LK/ATF/TEE/GZ 通过签名验证。
 
+> **仅用于安全研究。使用前确保已获授权。**
 
-For mtk devices,preloader verifies bl2_ext/lk/atf and then jumps to it.
+---
 
-These images is signed with ASN.1 certs.
+## 漏洞原理
 
-But there is a logic flaw in the ASN.1 parsing process.
+Preloader 用 CERT1 + CERT2 两级证书验证启动镜像。CERT2 内含两个 OID 哈希：
 
-For old V5/V6 devices, cert content is identified by bypass_mode 1.
+| OID | 用途 |
+|-----|------|
+| `2.16.886.2454.2.4` | 镜像头（part_hdr_t 512字节）的 SHA-256/384 |
+| `2.16.886.2454.2.1` | 镜像数据（padding 后）的 SHA-256/384 |
 
-In this mode, any object will be stepped in.
+工具在 CERT2 DER 前插入一个 `0xA0`（context-specific）包装块，内含新的 OID + BitString。Preloader 的哈希比对逻辑优先命中插入的值，而原始 CERT2 结构和签名不变。
 
-So we can make a fake cert with 0x3(bit string) object.
+### bypass_mode
 
-The fake cert is unmodified. So it can pass the validation.
+| 模式 | 适用设备 | 做法 |
+|------|---------|------|
+| `bypass_mode=0`（默认） | 新 V6 | 只插 `0xA0` 块。解析器跳过非 `0x30` 对象 |
+| `bypass_mode=1`（`--legacy`） | V5 / 旧 V6 | 额外插一个 BitString 包装原始 CERT2 DER，让旧解析器能步入找到原始 SEQUENCE |
 
-The real cert is under the fake cert.And We can put the image hash and image hdr hash at the beginning of the real cert.
+**不确定用哪个？** 先不加 `--legacy` 试。刷入后如果签名验证失败，改用 `--legacy`。
 
-For new V6 devices, cert content is identified by bypass_mode 0
+---
 
-In this mode, any object will be skipped except 0x30.
+## 启动链与 Patch 策略
 
-So we can put the image hash and image hdr hash at the beginning of the cert.
+### V5（无 bl2_ext 分区）
 
-Then keep other things unmodified.
+```
+BootROM → Preloader → LK (cert bypass) → Kernel
+                    → ATF/TEE (cert bypass)
+```
 
-Then we can modify the image content.
+只需 patch 和 cert bypass 签名 LK 和（可选的）ATF。Preloader 直接验证，无中间层。
 
-So we gain EL3 control.
+### V6（有 bl2_ext 分区）
 
-You need to patch BL2_EXT to remove the vefification of lk or atf.
+```
+BootROM → Preloader → bl2_ext (cert bypass) → LK (需先 patch bl2_ext 去验证)
+                                             → ATF/TEE (同上)
+```
 
-And then patch LK to remove the verification of lk_main_dtb(otherwise it will crash)
+bl2_ext 有独立验证逻辑。必须先 patch bl2_ext 去除它对 LK/ATF 的验证调用，再 cert bypass 签名 bl2_ext 本身。否则修改过的 LK/ATF 仍被拒绝。
 
-And you need to patch LK to remove all bootloader locks including set_lock_state to avoid locking back or some crashes.
+---
 
+## 工具一览
 
+| 脚本 | 做什么 | 关键参数 |
+|------|--------|---------|
+| `parse-part-img.py` | 解析 MKIMG 复合镜像结构 | `--dump` 看结构, `--split -o dir/` 拆分 |
+| `build-part-img.py` | 重组复合镜像 | `replace --name X --file Y -o Z` |
+| `sign_mtk_cert.py` | **核心：CERT2 哈希覆盖** | `-w` 写入, `-o` 输出, `--legacy` 旧设备 |
+| `verify_mtk_image.py` | 验证 CERT1/CERT2 签名和哈希 | 直接跟文件名 |
+| `parse_mtk_certs.py` | 打印 CERT1/CERT2 的 ASN.1 结构 | 调试用 |
+| `parse_preloader.py` | 解析 preloader 头、加载地址、分区策略表 | 直接跟文件名 |
+| `parse_da.py` | 解析 Download Agent 二进制 | 直接跟文件名 |
 
-# Usage:
+---
 
-python parse-part-img.py [the original image file] --split -o out
+## 操作流程：修改 LK 并刷入（V5 设备）
 
-Then you can see separate images (such as lk,bl2_ext,lk_main_dtb,aee)
+以下假设你的 `lk.img` 是 MKIMG 复合镜像（包含 lk + cert 等子镜像）。
 
-python parse_preloader.py [preloader image]
+### 1. 查看复合镜像结构
 
-You can get lk/bl2_ext load address via this script
+```bash
+python3 parse-part-img.py lk.img --dump
+```
 
-after patching
-For new v6 devices
-python sign_mtk_cert.py [single image file] -w
-For Old v6 devices/v5 devices
-python sign_mtk_cert.py [single image file] -w --legacy
+输出示例：
+```
+[0] name=lk         type=0x00000000  dsize=360448  ...
+[1] name=lk_cert1   type=0x02000000  dsize=1420    ...
+[2] name=lk_cert2   type=0x02000002  dsize=1836    ...  img_list_end=1
+```
 
-Then insert the new signed image back
+### 2. 拆分子镜像
 
-python build-part-img.py replace [original image file] --name [the single image name you want to insert back] -- file [the new signed single image]
+```bash
+python3 parse-part-img.py lk.img --split -o lk_parts/
+```
 
+每个逻辑镜像（含它的 CERT1 + CERT2）打包成一个文件：
+```
+lk_parts/
+├── lk.bin             # part_hdr + LK 数据 + CERT1 + CERT2 (一体)
+└── lk_main_dtb.bin    # 如果有多个子镜像，每个各一个文件
+```
 
+### 3. 修改 LK 数据
+
+用 IDA/Ghidra 或十六进制编辑器修改 `lk_parts/lk.bin`。注意：
+
+- 前 512 字节是 part_hdr_t 头，**不要动**
+- 偏移 512 开始才是 LK 代码
+- 典型修改：NOP 签名验证调用、跳过 bootloader 锁检查等
+
+### 4. cert bypass 签名（直接对拆分文件操作）
+
+```bash
+# 标准模式（新设备优先试这个）
+python3 sign_mtk_cert.py -w lk_parts/lk.bin -o lk_parts/lk_signed.bin
+
+# 如果失败，用 legacy 模式
+python3 sign_mtk_cert.py -w --legacy lk_parts/lk.bin -o lk_parts/lk_signed.bin
+```
+
+这一步做了什么：
+1. 找到文件中的 CERT2 分区
+2. 计算修改后 LK 的 part_hdr 哈希和数据哈希
+3. 构建 `0xA0` 覆盖块（含新哈希的 OID + BitString）
+4. 插入 CERT2 DER 前面
+5. 更新 CERT2 的 dsize 字段
+
+### 5. 重建复合镜像
+
+如果原始 `lk.img` 只有一个子镜像，签名后的 `lk_signed.bin` 就能直接刷。
+
+如果有多个子镜像（如 lk + lk_main_dtb），用 `concat` 把它们拼回去：
+
+```bash
+python3 build-part-img.py concat lk_parts/ --order lk,lk_main_dtb -o lk_final.img
+```
+
+或者用 `replace` 替换原始镜像中的指定子镜像（会自动处理 cert 区域对齐）：
+
+```bash
+python3 build-part-img.py replace lk.img \
+    --name lk \
+    --file lk_parts/lk_signed.bin \
+    -o lk_final.img
+```
+
+### 6. 验证
+
+```bash
+python3 verify_mtk_image.py lk_final.img
+```
+
+输出中关注：
+- `Image Header Hash`: orig 和 calc 应该不同（因为你改了数据），但 `override` 应匹配 calc
+- `Image Hash`: 同上
+- CERT2 RSA 签名：应显示 PASS（原始签名未变，覆盖块不影响签名验证）
+
+### 7. 刷入
+
+```bash
+# SP Flash Tool: 选择对应分区，加载 lk_final.img 刷入
+# 或 fastboot:
+fastboot flash lk lk_final.img
+```
+
+---
+
+## 操作流程：修改 ATF/TEE（V5/V6 设备）
+
+ATF 通常打包在 `tee1.img` 内，也是 MKIMG 复合镜像。流程和 LK 一样：
+
+```bash
+# 1. 查看结构
+python3 parse-part-img.py tee1.img --dump
+
+# 2. 拆分
+python3 parse-part-img.py tee1.img --split -o tee_parts/
+
+# 3. 修改 tee_parts/tee1.bin（偏移 512 之后是 ATF 代码）
+
+# 4. cert bypass 签名（直接对拆分文件）
+python3 sign_mtk_cert.py -w tee_parts/tee1.bin -o tee_parts/tee1_signed.bin
+
+# 5. 重建（单个子镜像直接用，多个子镜像用 concat）
+python3 build-part-img.py concat tee_parts/ --order tee1 -o tee_final.img
+
+# 6. 验证
+python3 verify_mtk_image.py tee_final.img
+
+# 7. 刷入
+fastboot flash tee1 tee_final.img
+```
+
+---
+
+## 分区策略分析
+
+```bash
+# 查看 preloader 加载地址和分区策略表
+python3 parse_preloader.py preloader.bin
+```
+
+输出的 `policy_part_map` 表显示每个分区的验证策略（签名类型、CERT 格式等），用于确定哪些分区需要签名、用什么算法。
+
+---
+
+## 注意事项
+
+1. **备份原始镜像**。错误的 patch 可能导致硬砖（需 BROM 模式救砖）
+2. **镜像大小**。cert bypass 会增大 CERT2 的 dsize。确保最终镜像不超出分区容量
+3. **漏洞时效性**。此漏洞可能在新版 preloader 中已修复。如果 CERT2 bypass 失败，可能说明设备已更新
+4. **V6 设备额外步骤**。必须先 patch bl2_ext 去除二次验证，否则只 bypass CERT2 无效
+5. **Preloader 本身**。修改 preloader 需要 Image Key 私钥做 PSS 重签名，目前未破解。cert bypass 只适用于 preloader 验证的下游镜像（LK/ATF/TEE/GZ）

@@ -443,6 +443,16 @@ def main():
     new_padded = roundup(len(new_blob), c_hdr.align_sz)
     print(f'CERT2 new dsize={len(new_blob)}, padded={new_padded}, align={c_hdr.align_sz}')
 
+    if len(out_bytes) > len(data):
+        growth = len(out_bytes) - len(data)
+        overflow = out_bytes[len(data):]
+        if all(b == 0 for b in overflow):
+            out_bytes = out_bytes[:len(data)]
+            print(f'Trimmed {growth} bytes trailing zero padding to keep original size')
+        else:
+            print(f'WARNING: output is {growth} bytes larger than input, '
+                  f'trailing bytes are NOT zero — not truncating')
+
     out_path = Path(args.out) if args.out else path.with_suffix(path.suffix + '.signed')
     out_path.write_bytes(out_bytes)
     print('Write complete:', out_path)
