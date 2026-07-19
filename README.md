@@ -301,11 +301,11 @@ python3 parse_preloader.py preloader.bin
 
 ## 各平台 lk.img 结构差异
 
-| 类型 | 子镜像 | 第二设备树 |
-|------|--------|-----------|
-| V5 | lk, lk_main_dtb | 无 |
-| V6 | lk, bl2_ext, aee, lk_main_dtb | **特殊**：无 part_hdr_t，存储在主列表之后（带 cert1+cert2） |
-| V6+AVF | lk, bl2_ext, aee, lk_main_dtb, lk_dtbo | 标准格式：有 part_hdr_t |
+| 类型 | 子镜像 | lk_second_dtb |
+|------|--------|--------------|
+| V5 | lk, lk_main_dtb, lk_second_dtb | 标准格式（有 part_hdr_t） |
+| V6 | lk, bl2_ext, aee, lk_main_dtb | headerless（无 part_hdr_t，带 cert1+cert2） |
+| V6+AVF | lk, bl2_ext, aee, lk_main_dtb, lk_dtbo | 无（lk_dtbo 是标准子镜像，有 part_hdr_t） |
 
 ### Headerless 第二设备树（部分 V6 设备）
 
