@@ -545,6 +545,233 @@ def sign_headerless_image(data, args, path):
     print('Write complete:', out_path)
 
 
+def _sign_one_cert2(out_data, t_off, t_data_off, t_hdr, c_off, c_blob_off, c_hdr, legacy=False):
+    """Sign a single image+cert2 pair in-place within out_data (bytearray).
+    Returns the size delta (new_padded - old_padded)."""
+    c_dsz = c_hdr.dsize
+    der = bytes(out_data[c_blob_off:c_blob_off + c_dsz])
+
+    hdr_bit, _ = find_oid_bitstring(der, OID_IMAGE_HEADER_HASH)
+    img_bit, _ = find_oid_bitstring(der, OID_IMAGE_HASH)
+
+    old_hdr_digest = hdr_bit[1:] if hdr_bit and len(hdr_bit) > 1 else None
+    old_img_digest = img_bit[1:] if img_bit and len(img_bit) > 1 else None
+
+    if old_hdr_digest is None and old_img_digest is None:
+        return 0
+
+    img_hdr_sz = t_hdr.hdr_sz if t_hdr.hdr_sz else PART_HDR_SIZE
+    header_bytes = bytes(out_data[t_off:t_off + img_hdr_sz])
+    padded_size = t_hdr.padded_data_size()
+    data_bytes = bytes(out_data[t_data_off:t_data_off + padded_size])
+
+    new_hdr_digest = None
+    if old_hdr_digest is not None:
+        hfn = hashlib.sha256 if len(old_hdr_digest) == 32 else hashlib.sha384
+        new_hdr_digest = hfn(header_bytes).digest()
+
+    new_img_digest = None
+    if old_img_digest is not None:
+        hfn2 = hashlib.sha256 if len(old_img_digest) == 32 else hashlib.sha384
+        new_img_digest = hfn2(data_bytes).digest()
+
+    insert_block = build_hash_override_block(new_hdr_digest, new_img_digest)
+    if not insert_block:
+        return 0
+
+    prefix_blocks = []
+    if legacy:
+        original_cert2_der, _ = find_original_cert2_der(der)
+        legacy_block = build_bitstring_tlv(original_cert2_der)
+        prefix_blocks.append(legacy_block)
+    prefix_blocks.append(insert_block)
+
+    new_blob = b''.join(prefix_blocks) + der
+    old_padded = c_hdr.padded_data_size()
+    new_padded = roundup(len(new_blob), c_hdr.align_sz)
+    new_blob_padded = new_blob + b'\x00' * (new_padded - len(new_blob))
+
+    out_data[c_blob_off:c_blob_off + old_padded] = new_blob_padded
+    struct.pack_into('<I', out_data, c_off + 4, len(new_blob))
+    return new_padded - old_padded
+
+
+def _sign_headerless_tail(out_data, list_end_offset, legacy=False):
+    """Sign a headerless tail region (e.g. lk_second_dtb) after the main image list.
+    Returns size delta."""
+    tail_data = bytes(out_data[list_end_offset:])
+
+    first_nonzero = None
+    for i in range(len(tail_data)):
+        if tail_data[i] != 0:
+            first_nonzero = i
+            break
+    if first_nonzero is None:
+        return 0
+
+    magic_bytes = struct.pack('<I', PART_MAGIC)
+    cert_parts = []
+    pos = first_nonzero
+    while pos + PART_HDR_SIZE <= len(tail_data):
+        idx = tail_data.find(magic_bytes, pos)
+        if idx < 0:
+            break
+        if idx + PART_HDR_SIZE > len(tail_data):
+            break
+        try:
+            hdr = PartHdr.parse_from_bytes(tail_data, idx)
+        except struct.error:
+            pos = idx + 4
+            continue
+        if hdr.magic == PART_MAGIC and hdr.name.lower().startswith('cert'):
+            abs_off = list_end_offset + idx
+            cert_parts.append((len(cert_parts), abs_off, abs_off + PART_HDR_SIZE,
+                              abs_off + PART_HDR_SIZE + hdr.padded_data_size(), hdr))
+            pos = idx + PART_HDR_SIZE + hdr.padded_data_size()
+        else:
+            break
+
+    if not cert_parts:
+        return 0
+
+    cert2_entry = None
+    for entry in cert_parts:
+        if entry[4].img_type == IMG_TYPE_CERT2:
+            cert2_entry = entry
+            break
+    if not cert2_entry:
+        return 0
+
+    first_cert_abs = cert_parts[0][1]
+    data_start = list_end_offset + first_nonzero
+    image_region = bytes(out_data[data_start:first_cert_abs])
+
+    c_idx, c_off, c_blob_off, c_next_off, c_hdr = cert2_entry
+    c_dsz = c_hdr.dsize
+    der = bytes(out_data[c_blob_off:c_blob_off + c_dsz])
+
+    hdr_bit, _ = find_oid_bitstring(der, OID_IMAGE_HEADER_HASH)
+    img_bit, _ = find_oid_bitstring(der, OID_IMAGE_HASH)
+    old_hdr_digest = hdr_bit[1:] if hdr_bit and len(hdr_bit) > 1 else None
+    old_img_digest = img_bit[1:] if img_bit and len(img_bit) > 1 else None
+
+    hash_len = 32
+    if old_img_digest and len(old_img_digest) == 48:
+        hash_len = 48
+    elif old_hdr_digest and len(old_hdr_digest) == 48:
+        hash_len = 48
+    hfn = hashlib.sha256 if hash_len == 32 else hashlib.sha384
+
+    new_hdr_digest = hfn(image_region[:PART_HDR_SIZE]).digest() if old_hdr_digest is not None else None
+    new_img_digest = hfn(image_region).digest()
+
+    insert_block = build_hash_override_block(new_hdr_digest, new_img_digest)
+    if not insert_block:
+        return 0
+
+    prefix_blocks = []
+    if legacy:
+        original_cert2_der, _ = find_original_cert2_der(der)
+        legacy_block = build_bitstring_tlv(original_cert2_der)
+        prefix_blocks.append(legacy_block)
+    prefix_blocks.append(insert_block)
+
+    new_blob = b''.join(prefix_blocks) + der
+    old_padded = c_hdr.padded_data_size()
+    new_padded = roundup(len(new_blob), c_hdr.align_sz)
+    new_blob_padded = new_blob + b'\x00' * (new_padded - len(new_blob))
+
+    out_data[c_blob_off:c_blob_off + old_padded] = new_blob_padded
+    struct.pack_into('<I', out_data, c_off + 4, len(new_blob))
+    return new_padded - old_padded
+
+
+def sign_composite_image(data, args, path):
+    """Sign ALL sub-images in a composite MKIMG image (lk.img, tee.img, etc.)."""
+    parts = parse_part_headers(data)
+    if not parts:
+        print('No part_hdr_t headers found')
+        sys.exit(1)
+
+    groups = []
+    i = 0
+    while i < len(parts):
+        idx, off, data_off, next_off, hdr = parts[i]
+        group = hdr.img_type & 0xff000000
+        if group == IMG_TYPE_GROUP_CERT:
+            i += 1
+            continue
+        img_entry = parts[i]
+        cert2_entry = None
+        j = i + 1
+        while j < len(parts):
+            _, _, _, _, h = parts[j]
+            g = h.img_type & 0xff000000
+            if g != IMG_TYPE_GROUP_CERT:
+                break
+            if h.img_type == IMG_TYPE_CERT2:
+                cert2_entry = parts[j]
+            j += 1
+        groups.append((img_entry, cert2_entry))
+        i = j
+
+    list_end_offset = parts[-1][3]
+
+    if not groups:
+        print('No image groups found')
+        sys.exit(1)
+
+    print(f'Found {len(groups)} sub-image(s) in composite image')
+    for img_entry, cert2_entry in groups:
+        has_cert = 'yes' if cert2_entry else 'no'
+        print(f'  {img_entry[4].name}: cert2={has_cert}')
+
+    if not args.write:
+        print('No -w specified; use -w --all to write.')
+        return
+
+    out_data = bytearray(data)
+    signed_count = 0
+
+    has_tail = False
+    tail_check = bytes(out_data[list_end_offset:])
+    for b in tail_check:
+        if b != 0:
+            has_tail = True
+            break
+
+    if has_tail:
+        delta = _sign_headerless_tail(out_data, list_end_offset, legacy=args.legacy)
+        if delta != 0 or True:
+            magic_bytes = struct.pack('<I', PART_MAGIC)
+            if tail_check.find(magic_bytes, next(i for i, b in enumerate(tail_check) if b != 0)) >= 0:
+                signed_count += 1
+                print(f'  [signed] tail (headerless)')
+
+    for img_entry, cert2_entry in reversed(groups):
+        if cert2_entry is None:
+            continue
+        t_idx, t_off, t_data_off, t_next_off, t_hdr = img_entry
+        c_idx, c_off, c_blob_off, c_next_off, c_hdr = cert2_entry
+        _sign_one_cert2(out_data, t_off, t_data_off, t_hdr,
+                        c_off, c_blob_off, c_hdr, legacy=args.legacy)
+        signed_count += 1
+        print(f'  [signed] {t_hdr.name}')
+
+    original_size = len(data)
+    if len(out_data) > original_size:
+        overflow = out_data[original_size:]
+        if all(b == 0 for b in overflow):
+            out_data = out_data[:original_size]
+            print(f'Trimmed to original size ({original_size} bytes)')
+        else:
+            print(f'WARNING: output is {len(out_data) - original_size} bytes larger than input')
+
+    out_path = Path(args.out) if args.out else path.with_suffix(path.suffix + '.signed')
+    Path(out_path).write_bytes(bytes(out_data))
+    print(f'Signed {signed_count} sub-image(s), wrote: {out_path}')
+
+
 def main():
     p = argparse.ArgumentParser(description='MTK CERT2 hash extractor and updater')
     p.add_argument('image', help='input image file')
@@ -552,6 +779,8 @@ def main():
     p.add_argument('-o', '--out', help='output file (default: <input>.signed)')
     p.add_argument('--legacy', action='store_true',
                    help='prepend BITSTRING(original CERT2 DER) for old libsec bypass_mode=1')
+    p.add_argument('--all', action='store_true',
+                   help='sign ALL sub-images in a composite image (lk.img, tee.img)')
     args = p.parse_args()
 
     path = Path(args.image)
@@ -563,7 +792,10 @@ def main():
 
     parts = parse_part_headers(data)
     if parts:
-        sign_normal_image(data, args, path)
+        if args.all:
+            sign_composite_image(data, args, path)
+        else:
+            sign_normal_image(data, args, path)
     else:
         print('No part_hdr_t at file start, trying headerless mode...')
         sign_headerless_image(data, args, path)

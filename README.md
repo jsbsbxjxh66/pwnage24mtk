@@ -71,7 +71,7 @@ bl2_ext 本身由 preloader 通过 CERT2 验证。bl2_ext 内部**可能**有独
 |------|--------|---------|
 | `parse-part-img.py` | 解析/拆分 MKIMG 复合镜像 | `--dump` 看结构, `--split -o dir/` 拆分（生成 manifest.json） |
 | `build-part-img.py` | 重组复合镜像 | `rebuild dir/` 一键重签打包, `concat`, `replace` |
-| `sign_mtk_cert.py` | **核心：CERT2 哈希覆盖** | `-w` 写入, `-o` 输出, `--legacy` 旧设备 |
+| `sign_mtk_cert.py` | **核心：CERT2 哈希覆盖** | `-w` 写入, `-o` 输出, `--all` 签全部子镜像, `--legacy` 旧设备 |
 | `verify_mtk_image.py` | 验证 CERT1/CERT2 签名和哈希 | 直接跟文件名 |
 | `parse_mtk_certs.py` | 打印 CERT1/CERT2 的 ASN.1 结构 | 调试用 |
 | `parse_preloader.py` | 解析 preloader 头、加载地址、分区策略表 | 直接跟文件名 |
@@ -123,14 +123,17 @@ lk_parts/
 - 偏移 512 开始才是 LK 代码
 - 典型修改：NOP 签名验证调用、跳过 bootloader 锁检查等
 
-### 4. cert bypass 签名（直接对拆分文件操作）
+### 4. cert bypass 签名
 
 ```bash
-# 标准模式（新设备优先试这个）
+# 方式一：直接对完整 lk.img 签名所有子镜像（最简单）
+python3 sign_mtk_cert.py -w --all lk.img -o lk_signed.img
+
+# 方式二：对单个拆分文件签名
 python3 sign_mtk_cert.py -w lk_parts/lk.bin -o lk_parts/lk_signed.bin
 
-# 如果失败，用 legacy 模式
-python3 sign_mtk_cert.py -w --legacy lk_parts/lk.bin -o lk_parts/lk_signed.bin
+# 如果失败，用 legacy 模式（加 --legacy）
+python3 sign_mtk_cert.py -w --all --legacy lk.img -o lk_signed.img
 ```
 
 这一步做了什么：
