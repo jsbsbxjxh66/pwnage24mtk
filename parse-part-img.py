@@ -6,6 +6,7 @@
 from __future__ import print_function
 
 import argparse
+import json
 import os
 import re
 import struct
@@ -234,6 +235,73 @@ def copy_range(src_fp, dst_path, offset, size):
             remaining -= len(chunk)
 
 
+def find_tail_region(fp, list_end_offset, file_size):
+    """Detect post-list tail data (e.g. lk_dtbo stored without part_hdr_t).
+    Returns (tail_start, tail_end) or None if no meaningful tail data exists.
+    tail_start is the first non-zero byte (page-aligned region start),
+    tail_end is after the last cert2 following the tail data.
+    """
+    if list_end_offset >= file_size:
+        return None
+
+    fp.seek(list_end_offset)
+    remaining = fp.read(file_size - list_end_offset)
+    if not remaining:
+        return None
+
+    first_nonzero = None
+    for i in range(len(remaining)):
+        if remaining[i] != 0:
+            first_nonzero = i
+            break
+    if first_nonzero is None:
+        return None
+
+    data_start = list_end_offset + first_nonzero
+    magic_bytes = struct.pack("<I", PART_MAGIC)
+    last_end = data_start
+
+    search_pos = first_nonzero
+    while True:
+        idx = remaining.find(magic_bytes, search_pos)
+        if idx < 0:
+            break
+        abs_off = list_end_offset + idx
+        if abs_off + PART_HDR_SIZE > file_size:
+            break
+        fp.seek(abs_off)
+        hdr_data = fp.read(PART_HDR_SIZE)
+        if len(hdr_data) < PART_HDR_SIZE:
+            break
+        hdr = PartHdr.parse(hdr_data)
+        if hdr.magic != PART_MAGIC:
+            search_pos = idx + 4
+            continue
+        n = (hdr.name or "").lower()
+        if n.startswith("cert"):
+            cert_end = abs_off + PART_HDR_SIZE + hdr.padded_data_size()
+            if cert_end > last_end:
+                last_end = cert_end
+            search_pos = idx + PART_HDR_SIZE
+            if hdr.img_list_end:
+                break
+        else:
+            break
+
+    if last_end <= data_start:
+        last_nz = first_nonzero
+        for i in range(len(remaining) - 1, first_nonzero, -1):
+            if remaining[i] != 0:
+                last_nz = i
+                break
+        last_end = list_end_offset + last_nz + 1
+
+    if last_end - list_end_offset < 64:
+        return None
+
+    return (list_end_offset, last_end)
+
+
 def split_images(image_path, out_dir, image_name):
     file_size = os.path.getsize(image_path)
     if out_dir is None:
@@ -244,6 +312,8 @@ def split_images(image_path, out_dir, image_name):
 
     written = 0
     skip_end = 0
+    list_end_offset = 0
+    manifest_images = []
     with open(image_path, "rb") as fp:
         for index, offset, data_offset, next_offset, hdr in iter_images(fp, file_size):
             if offset < skip_end:
@@ -254,6 +324,7 @@ def split_images(image_path, out_dir, image_name):
 
             # determine whether the next one or two headers are certs
             end_offset = next_offset
+            has_cert = False
             try:
                 # peek first following header
                 next_hdr = read_hdr(fp, next_offset, file_size)
@@ -267,6 +338,7 @@ def split_images(image_path, out_dir, image_name):
                 return n.startswith("cert")
 
             if is_cert_hdr(next_hdr):
+                has_cert = True
                 next_hdr_end = next_hdr.next_offset(next_offset)
                 end_offset = next_hdr_end
                 # peek second following header
@@ -286,8 +358,47 @@ def split_images(image_path, out_dir, image_name):
             print("%s: offset=0x%x size=%u image=%s load_addr=%s" %
                   (out_path, offset, size,
                    hdr.name, fmt_value("maddr", hdr.maddr)))
+            manifest_images.append({
+                "name": hdr.name,
+                "file": filename,
+                "has_cert": has_cert,
+            })
             written += 1
             skip_end = end_offset
+            list_end_offset = end_offset
+
+        # Check for tail data after the main image list (e.g. lk_second_dtb without part_hdr_t)
+        tail_info = None
+        if image_name is None:
+            tail = find_tail_region(fp, list_end_offset, file_size)
+            if tail is not None:
+                tail_start, tail_end = tail
+                tail_size = tail_end - tail_start
+                tail_path = os.path.join(out_dir, "lk_second_dtb.bin")
+                copy_range(fp, tail_path, tail_start, tail_size)
+                print("%s: offset=0x%x size=%u (post-list second dtb with certs)" %
+                      (tail_path, tail_start, tail_size))
+                tail_info = {
+                    "file": "lk_second_dtb.bin",
+                    "has_cert": True,
+                    "headerless": True,
+                }
+                written += 1
+
+    # Write manifest
+    if image_name is None:
+        manifest = {
+            "source": os.path.basename(image_path),
+            "source_size": file_size,
+            "images": manifest_images,
+        }
+        if tail_info:
+            manifest["tail"] = tail_info
+        manifest_path = os.path.join(out_dir, "manifest.json")
+        with open(manifest_path, "w") as mf:
+            json.dump(manifest, mf, indent=2)
+        print("wrote manifest: %s" % manifest_path)
+
     if image_name is not None and written == 0:
         raise ParseError("image not found: %s" % image_name)
     print("wrote %d sub-image(s) to %s" % (written, out_dir))

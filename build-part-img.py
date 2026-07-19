@@ -5,21 +5,19 @@ Tool to rebuild or concatenate MTK part_hdr_t multi-image files.
 Features:
 - replace: replace a single sub-image (by name) in an existing multi-image file
   with a provided single-image file (header+data) or raw data file.
-  Writes output to specified path or <input>.new by default.
 
 - concat: concatenate single-image files from a directory in a specified order
   (or default order: lk bl2_ext aee lk_main_dtb lk_dtbo) to create a new
   multi-image file.
 
-This script expects single-image files to contain a 512-byte part_hdr_t followed
-by the image data (split produced files). Concatenation joins single-image
-files directly (no additional padding). Replacement uses the entire single-image
-file (header+data and any embedded cert headers) to replace the corresponding
-region in a multi-image file.
+- rebuild: read manifest.json from a split directory, re-sign all sub-images
+  that have CERT2, concatenate in order, and pad to original partition size.
+  One-command workflow: split → modify → rebuild.
 """
 from __future__ import print_function
 
 import argparse
+import json
 import os
 import re
 import struct
@@ -230,7 +228,6 @@ def concat_mode(dir_path, order_names=None, out_path=None, verbose=False):
             if verbose:
                 print("will include: %s" % fpath)
 
-    # also include any additional files in directory not in order? No — follow requested order only.
     if not files_to_concat:
         raise ParseError("no files found to concat in %s" % dir_path)
 
@@ -239,7 +236,6 @@ def concat_mode(dir_path, order_names=None, out_path=None, verbose=False):
             if verbose:
                 print("adding %s" % fpath)
             with open(fpath, "rb") as f:
-                # copy file contents as-is
                 f.seek(0)
                 remaining = os.path.getsize(fpath)
                 while remaining:
@@ -248,7 +244,222 @@ def concat_mode(dir_path, order_names=None, out_path=None, verbose=False):
                         raise ParseError("unexpected EOF while reading %s" % fpath)
                     out_fp.write(chunk)
                     remaining -= len(chunk)
+
+        # Append lk_second_dtb if exists (post-list dtb data without part_hdr_t)
+        tail_path = os.path.join(dir_path, "lk_second_dtb.bin")
+        if os.path.exists(tail_path):
+            tail_size = os.path.getsize(tail_path)
+            if tail_size > 0:
+                if verbose:
+                    print("appending lk_second_dtb: %s (%d bytes)" % (tail_path, tail_size))
+                with open(tail_path, "rb") as f:
+                    remaining = tail_size
+                    while remaining:
+                        chunk = f.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise ParseError("unexpected EOF while reading %s" % tail_path)
+                        out_fp.write(chunk)
+                        remaining -= len(chunk)
+                print("appended lk_second_dtb (%d bytes)" % tail_size)
+
     print("wrote concatenated image to %s" % out_path)
+
+
+def resign_file(file_path, legacy=False, verbose=False):
+    """Re-sign a single sub-image file by updating its CERT2 hash override."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import sign_mtk_cert
+
+    data = open(file_path, 'rb').read()
+    parts = sign_mtk_cert.parse_part_headers(data)
+
+    if parts:
+        # Normal image with part_hdr_t
+        cert2_entry = None
+        for idx, off, data_off, next_off, hdr in parts:
+            if hdr.img_type == sign_mtk_cert.IMG_TYPE_CERT2:
+                cert2_entry = (idx, off, data_off, next_off, hdr)
+                break
+        if not cert2_entry:
+            if verbose:
+                print("  [skip] %s: no CERT2 found" % os.path.basename(file_path))
+            return False
+
+        c_idx, c_off, c_blob_off, c_next_off, c_hdr = cert2_entry
+        der = data[c_blob_off:c_blob_off + c_hdr.dsize]
+
+        # Find target image (last non-cert before cert2)
+        target_part = None
+        for idx, off, data_off, next_off, hdr in parts:
+            if off < c_off:
+                group = hdr.img_type & 0xff000000
+                if group != sign_mtk_cert.IMG_TYPE_GROUP_CERT:
+                    target_part = (idx, off, data_off, next_off, hdr)
+        if not target_part:
+            return False
+
+        t_idx, t_off, t_data_off, t_next_off, t_hdr = target_part
+        img_hdr_sz = t_hdr.hdr_sz if t_hdr.hdr_sz else PART_HDR_SIZE
+        header_bytes = data[t_off:t_off + img_hdr_sz]
+        padded_size = t_hdr.padded_data_size()
+        data_bytes = data[t_data_off:t_data_off + padded_size]
+    else:
+        # Headerless image (e.g. lk_second_dtb)
+        cert_parts = sign_mtk_cert.scan_cert_headers(data)
+        if not cert_parts:
+            if verbose:
+                print("  [skip] %s: no cert headers" % os.path.basename(file_path))
+            return False
+
+        cert2_entry = None
+        for idx, off, data_off, next_off, hdr in cert_parts:
+            if hdr.img_type == sign_mtk_cert.IMG_TYPE_CERT2:
+                cert2_entry = (idx, off, data_off, next_off, hdr)
+        if not cert2_entry:
+            return False
+
+        c_idx, c_off, c_blob_off, c_next_off, c_hdr = cert2_entry
+        der = data[c_blob_off:c_blob_off + c_hdr.dsize]
+
+        first_cert_off = cert_parts[0][1]
+        header_bytes = data[:PART_HDR_SIZE]
+        data_bytes = data[:first_cert_off]
+
+    # Detect hash algorithm from existing cert2
+    import hashlib
+    hdr_bit, _ = sign_mtk_cert.find_oid_bitstring(der, sign_mtk_cert.OID_IMAGE_HEADER_HASH)
+    img_bit, _ = sign_mtk_cert.find_oid_bitstring(der, sign_mtk_cert.OID_IMAGE_HASH)
+
+    hash_len = 32
+    if hdr_bit and len(hdr_bit) > 1 and len(hdr_bit[1:]) == 48:
+        hash_len = 48
+    elif img_bit and len(img_bit) > 1 and len(img_bit[1:]) == 48:
+        hash_len = 48
+    hfn = hashlib.sha256 if hash_len == 32 else hashlib.sha384
+
+    new_hdr_digest = hfn(header_bytes).digest() if hdr_bit else None
+    new_img_digest = hfn(data_bytes).digest() if img_bit else None
+
+    insert_block = sign_mtk_cert.build_hash_override_block(new_hdr_digest, new_img_digest)
+    if not insert_block:
+        return False
+
+    prefix_blocks = []
+    if legacy and parts:
+        try:
+            original_cert2_der, _ = sign_mtk_cert.find_original_cert2_der(der)
+            prefix_blocks.append(sign_mtk_cert.build_bitstring_tlv(original_cert2_der))
+        except ValueError:
+            pass
+    prefix_blocks.append(insert_block)
+
+    new_blob = b''.join(prefix_blocks) + der
+    out_bytes = sign_mtk_cert.replace_cert2_blob(data, c_blob_off, c_off, c_hdr, new_blob)
+
+    if len(out_bytes) > len(data):
+        growth = len(out_bytes) - len(data)
+        overflow = out_bytes[len(data):]
+        if all(b == 0 for b in overflow):
+            out_bytes = out_bytes[:len(data)]
+
+    with open(file_path, 'wb') as f:
+        f.write(out_bytes)
+    return True
+
+
+def rebuild_mode(dir_path, out_path=None, legacy=False, verbose=False):
+    """Read manifest.json, re-sign all sub-images, concat and pad to original size."""
+    manifest_path = os.path.join(dir_path, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise ParseError("manifest.json not found in %s (run parse-part-img.py --split first)" % dir_path)
+
+    with open(manifest_path, 'r') as f:
+        manifest = json.load(f)
+
+    source_size = manifest.get("source_size", 0)
+    images = manifest.get("images", [])
+    tail = manifest.get("tail")
+
+    if out_path is None:
+        out_path = manifest.get("source", "rebuilt") + ".signed"
+
+    print("[*] Rebuild from %s (%d images%s)" % (
+        dir_path, len(images), " + tail" if tail else ""))
+    print("[*] Target size: %d bytes (0x%x)" % (source_size, source_size))
+    print()
+
+    # Re-sign all sub-images with CERT2
+    print("── Re-signing ──")
+    for img in images:
+        fpath = os.path.join(dir_path, img["file"])
+        if not os.path.exists(fpath):
+            print("  [!] missing: %s" % img["file"])
+            continue
+        if not img.get("has_cert"):
+            print("  [skip] %s (no cert)" % img["name"])
+            continue
+        ok = resign_file(fpath, legacy=legacy, verbose=verbose)
+        if ok:
+            print("  [signed] %s" % img["name"])
+        else:
+            print("  [skip] %s (sign failed or no cert2)" % img["name"])
+
+    if tail and tail.get("has_cert"):
+        tail_path = os.path.join(dir_path, tail["file"])
+        if os.path.exists(tail_path):
+            ok = resign_file(tail_path, legacy=legacy, verbose=verbose)
+            if ok:
+                print("  [signed] %s (headerless)" % tail["file"])
+            else:
+                print("  [skip] %s" % tail["file"])
+
+    # Concatenate
+    print()
+    print("── Concatenating ──")
+    with open(out_path, "wb") as out_fp:
+        for img in images:
+            fpath = os.path.join(dir_path, img["file"])
+            if not os.path.exists(fpath):
+                raise ParseError("file missing: %s" % fpath)
+            fsize = os.path.getsize(fpath)
+            with open(fpath, "rb") as f:
+                remaining = fsize
+                while remaining:
+                    chunk = f.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise ParseError("unexpected EOF: %s" % fpath)
+                    out_fp.write(chunk)
+                    remaining -= len(chunk)
+            if verbose:
+                print("  + %s (%d bytes)" % (img["name"], fsize))
+
+        # Append tail
+        if tail:
+            tail_path = os.path.join(dir_path, tail["file"])
+            if os.path.exists(tail_path):
+                tsize = os.path.getsize(tail_path)
+                with open(tail_path, "rb") as f:
+                    remaining = tsize
+                    while remaining:
+                        chunk = f.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise ParseError("unexpected EOF: %s" % tail_path)
+                        out_fp.write(chunk)
+                        remaining -= len(chunk)
+                if verbose:
+                    print("  + %s (%d bytes, tail)" % (tail["file"], tsize))
+
+        # Pad to original size
+        current_size = out_fp.tell()
+        if source_size > 0 and current_size < source_size:
+            pad = source_size - current_size
+            out_fp.write(b'\x00' * pad)
+            print("  padded %d bytes to reach %d (0x%x)" % (pad, source_size, source_size))
+        elif current_size > source_size > 0:
+            print("  [!] WARNING: output %d bytes > original %d bytes" % (current_size, source_size))
+
+    print()
+    print("[*] wrote: %s (%d bytes)" % (out_path, os.path.getsize(out_path)))
 
 
 def parse_args(argv):
@@ -260,9 +471,6 @@ def parse_args(argv):
     p_replace.add_argument('--name', required=True, help='sub-image name to replace')
     p_replace.add_argument('--file', required=True, help='replacement single-image file (header+data, may include certs)')
     p_replace.add_argument('-o', '--out', help='output file path, default: <image>.new')
-    # No separate cert files needed; replacement single-image file should
-    # include any cert headers if present (the script will replace the
-    # original region including cert1/cert2 if they exist).
     p_replace.add_argument('-v', '--verbose', action='store_true')
 
     p_concat = sub.add_parser('concat', help='concatenate single-image files from a directory')
@@ -270,6 +478,13 @@ def parse_args(argv):
     p_concat.add_argument('--order', help='comma-separated image names in desired order')
     p_concat.add_argument('-o', '--out', help='output file path, default: <dir>.new')
     p_concat.add_argument('-v', '--verbose', action='store_true')
+
+    p_rebuild = sub.add_parser('rebuild',
+        help='re-sign all sub-images and rebuild (reads manifest.json from split dir)')
+    p_rebuild.add_argument('dir', help='split directory containing manifest.json')
+    p_rebuild.add_argument('-o', '--out', help='output file path')
+    p_rebuild.add_argument('--legacy', action='store_true', help='use legacy cert bypass mode')
+    p_rebuild.add_argument('-v', '--verbose', action='store_true')
 
     return parser.parse_args(argv)
 
@@ -284,6 +499,8 @@ def main(argv):
             if args.order:
                 order = [s.strip() for s in args.order.split(',') if s.strip()]
             concat_mode(args.dir, order_names=order, out_path=args.out, verbose=args.verbose)
+        elif args.cmd == 'rebuild':
+            rebuild_mode(args.dir, out_path=args.out, legacy=args.legacy, verbose=args.verbose)
     except (IOError, OSError, ParseError) as err:
         print("error: %s" % err, file=sys.stderr)
         return 1

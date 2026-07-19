@@ -135,6 +135,32 @@ def parse_part_headers(data: bytes):
     return out
 
 
+def scan_cert_headers(data: bytes):
+    """Scan for cert1/cert2 part_hdr_t anywhere in the file (for headerless images)."""
+    magic_bytes = struct.pack('<I', PART_MAGIC)
+    results = []
+    pos = 0
+    while pos + PART_HDR_SIZE <= len(data):
+        idx = data.find(magic_bytes, pos)
+        if idx < 0:
+            break
+        if idx + PART_HDR_SIZE > len(data):
+            break
+        try:
+            hdr = PartHdr.parse_from_bytes(data, idx)
+        except struct.error:
+            pos = idx + 4
+            continue
+        if hdr.magic == PART_MAGIC:
+            name = hdr.name.lower()
+            if name.startswith('cert'):
+                data_off = idx + PART_HDR_SIZE
+                next_off = idx + PART_HDR_SIZE + hdr.padded_data_size()
+                results.append((len(results), idx, data_off, next_off, hdr))
+        pos = idx + PART_HDR_SIZE + hdr.padded_data_size()
+    return results
+
+
 def parse_tlv_tree(data: bytes, base_off: int = 0):
     """递归解析 DER 数据，返回本层节点列表。每个节点为 dict:
        {off, tag_class, constructed, tagnum, hdr_len, length, val, children, tag_bytes}
@@ -310,31 +336,12 @@ def encode_der_root_with_insertion(der: bytes, insert_block: bytes):
     return new_der
 
 
-def main():
-    p = argparse.ArgumentParser(description='MTK CERT2 hash extractor and updater')
-    p.add_argument('image', help='input image file')
-    p.add_argument('-w', '--write', action='store_true', help='write updated image')
-    p.add_argument('-o', '--out', help='output file (default: <input>.signed)')
-    p.add_argument('--legacy', action='store_true',
-                   help='prepend BITSTRING(original CERT2 DER) for old libsec bypass_mode=1')
-    args = p.parse_args()
-
-    path = Path(args.image)
-    if not path.exists():
-        print('File not found:', path)
-        sys.exit(2)
-    data = path.read_bytes()
-    print(f"Name: {path.name}  Size: {len(data)}")
-
+def sign_normal_image(data, args, path):
+    """Sign an image that starts with part_hdr_t (normal MKIMG format)."""
     parts = parse_part_headers(data)
-    if not parts:
-        print('No part_hdr_t headers found, exiting')
-        sys.exit(1)
 
-    # find CERT2 header entry
     cert2_entry = None
     for idx, off, data_off, next_off, hdr in parts:
-        # group in high byte
         if hdr.img_type == IMG_TYPE_CERT2:
             cert2_entry = (idx, off, data_off, next_off, hdr)
             break
@@ -355,22 +362,21 @@ def main():
             sys.exit(1)
         print(f'Legacy source CERT2 DER at rel=0x{original_cert2_rel:x}, size={len(original_cert2_der)}')
 
-    # find OID 2.16.886.2454.2.4 (Image Header Hash)
     hdr_bit, hdr_oid_rel = find_oid_bitstring(der, OID_IMAGE_HEADER_HASH)
+    old_hdr_digest = None
     if hdr_bit is None:
         print('OID 2.16.886.2454.2.4 or its following BIT STRING not found in CERT2')
     else:
-        # hdr_bit includes unused-bits prefix
         if len(hdr_bit) < 1:
             print('Invalid bitstring for img header')
         else:
             old_hdr_digest = hdr_bit[1:]
             print('Image Header Hash (orig):', old_hdr_digest.hex())
-            alg_hdr = 'sha256' if len(old_hdr_digest) == 32 else ('sha384' if len(old_hdr_digest) == 48 else 'unknown')
-            print('Detected header hash algorithm:', alg_hdr)
+            print('Detected header hash algorithm:',
+                  'sha256' if len(old_hdr_digest) == 32 else 'sha384')
 
-    # find OID 2.16.886.2454.2.1 (Image Hash)
     img_bit, img_oid_rel = find_oid_bitstring(der, OID_IMAGE_HASH)
+    old_img_digest = None
     if img_bit is None:
         print('OID 2.16.886.2454.2.1 or its following BIT STRING not found in CERT2')
     else:
@@ -379,10 +385,9 @@ def main():
         else:
             old_img_digest = img_bit[1:]
             print('Image Hash (orig):', old_img_digest.hex())
-            alg_img = 'sha256' if len(old_img_digest) == 32 else ('sha384' if len(old_img_digest) == 48 else 'unknown')
-            print('Detected image hash algorithm:', alg_img)
+            print('Detected image hash algorithm:',
+                  'sha256' if len(old_img_digest) == 32 else 'sha384')
 
-    # locate previous non-cert part header as the image associated with this cert
     target_part = None
     for idx, off, data_off, next_off, hdr in parts:
         if off < c_off:
@@ -394,36 +399,30 @@ def main():
         if not args.write:
             return
         else:
-            print('Write mode but cannot locate target image; exiting')
             sys.exit(1)
 
     t_idx, t_off, t_data_off, t_next_off, t_hdr = target_part
     img_hdr_sz = t_hdr.hdr_sz if t_hdr.hdr_sz else PART_HDR_SIZE
-    # header bytes to hash: the part header region itself
     header_bytes = data[t_off:t_off + img_hdr_sz]
     padded_size = t_hdr.padded_data_size()
     data_bytes = data[t_data_off:t_data_off + padded_size]
 
-    # compute hashes according to detected algorithms (fall back to sha256)
-    if 'old_hdr_digest' in locals():
+    new_hdr_digest = None
+    if old_hdr_digest is not None:
         hfn = hashlib.sha256 if len(old_hdr_digest) == 32 else hashlib.sha384
         new_hdr_digest = hfn(header_bytes).digest()
         print('Image Header Hash (calc):', new_hdr_digest.hex())
-    else:
-        new_hdr_digest = None
 
-    if 'old_img_digest' in locals():
+    new_img_digest = None
+    if old_img_digest is not None:
         hfn2 = hashlib.sha256 if len(old_img_digest) == 32 else hashlib.sha384
         new_img_digest = hfn2(data_bytes).digest()
         print('Image Hash (calc):', new_img_digest.hex())
-    else:
-        new_img_digest = None
 
     if not args.write:
         print('No -w specified; finished printing, not writing.')
         return
 
-    # Build insertion block: 0xA0 { OID(2.16.886.2454.2.4) + BITSTR(new_hdr) + OID(2.16.886.2454.2.1) + BITSTR(new_img) }
     insert_block = build_hash_override_block(new_hdr_digest, new_img_digest)
     if not insert_block:
         print('No hashes to insert; skipping write.')
@@ -436,8 +435,6 @@ def main():
         print(f'Legacy BIT STRING wrapper size: {len(legacy_block)}')
     prefix_blocks.append(insert_block)
 
-    # Place generated sibling blocks before the existing CERT2 data. The header dsize
-    # is the unpadded logical size; the replaced region is aligned below.
     new_blob = b''.join(prefix_blocks) + der
     out_bytes = replace_cert2_blob(data, c_blob_off, c_off, c_hdr, new_blob)
     new_padded = roundup(len(new_blob), c_hdr.align_sz)
@@ -456,6 +453,120 @@ def main():
     out_path = Path(args.out) if args.out else path.with_suffix(path.suffix + '.signed')
     out_path.write_bytes(out_bytes)
     print('Write complete:', out_path)
+
+
+def sign_headerless_image(data, args, path):
+    """Sign a headerless image (e.g. lk_second_dtb) where cert1/cert2 are embedded
+    after the raw data without a preceding part_hdr_t."""
+    cert_parts = scan_cert_headers(data)
+    if not cert_parts:
+        print('No cert headers found in file, exiting')
+        sys.exit(1)
+
+    cert2_entry = None
+    cert1_entry = None
+    for idx, off, data_off, next_off, hdr in cert_parts:
+        if hdr.img_type == IMG_TYPE_CERT2:
+            cert2_entry = (idx, off, data_off, next_off, hdr)
+        elif cert1_entry is None:
+            cert1_entry = (idx, off, data_off, next_off, hdr)
+
+    if not cert2_entry:
+        print('No CERT2 found in headerless image, exiting')
+        sys.exit(1)
+
+    c_idx, c_off, c_blob_off, c_next_off, c_hdr = cert2_entry
+    c_dsz = c_hdr.dsize
+    der = data[c_blob_off:c_blob_off + c_dsz]
+    print(f'Found CERT2 at offset 0x{c_off:08x}, blob_off=0x{c_blob_off:08x}, dsz={c_dsz}')
+
+    # Determine data region: from file start to first cert header
+    first_cert_off = cert_parts[0][1]
+    image_data_region = data[:first_cert_off]
+    print(f'Headerless mode: data region = [0x0 : 0x{first_cert_off:x}] ({first_cert_off} bytes)')
+
+    hdr_bit, _ = find_oid_bitstring(der, OID_IMAGE_HEADER_HASH)
+    old_hdr_digest = None
+    if hdr_bit and len(hdr_bit) > 1:
+        old_hdr_digest = hdr_bit[1:]
+        print('Image Header Hash (orig):', old_hdr_digest.hex())
+
+    img_bit, _ = find_oid_bitstring(der, OID_IMAGE_HASH)
+    old_img_digest = None
+    if img_bit and len(img_bit) > 1:
+        old_img_digest = img_bit[1:]
+        print('Image Hash (orig):', old_img_digest.hex())
+
+    hash_len = 32
+    if old_img_digest and len(old_img_digest) == 48:
+        hash_len = 48
+    elif old_hdr_digest and len(old_hdr_digest) == 48:
+        hash_len = 48
+    hfn = hashlib.sha256 if hash_len == 32 else hashlib.sha384
+    alg_name = 'sha256' if hash_len == 32 else 'sha384'
+    print(f'Using algorithm: {alg_name}')
+
+    # For headerless images: "header" = first 512 bytes, "data" = entire region before certs
+    header_bytes = image_data_region[:PART_HDR_SIZE]
+    new_hdr_digest = hfn(header_bytes).digest() if old_hdr_digest is not None else None
+    new_img_digest = hfn(image_data_region).digest()
+
+    if new_hdr_digest:
+        print('Image Header Hash (calc):', new_hdr_digest.hex())
+    print('Image Hash (calc):', new_img_digest.hex())
+
+    if not args.write:
+        print('No -w specified; finished printing, not writing.')
+        return
+
+    insert_block = build_hash_override_block(new_hdr_digest, new_img_digest)
+    if not insert_block:
+        print('No hashes to insert; skipping write.')
+        return
+
+    prefix_blocks = [insert_block]
+    new_blob = b''.join(prefix_blocks) + der
+    out_bytes = replace_cert2_blob(data, c_blob_off, c_off, c_hdr, new_blob)
+    new_padded = roundup(len(new_blob), c_hdr.align_sz)
+    print(f'CERT2 new dsize={len(new_blob)}, padded={new_padded}, align={c_hdr.align_sz}')
+
+    if len(out_bytes) > len(data):
+        growth = len(out_bytes) - len(data)
+        overflow = out_bytes[len(data):]
+        if all(b == 0 for b in overflow):
+            out_bytes = out_bytes[:len(data)]
+            print(f'Trimmed {growth} bytes trailing zero padding to keep original size')
+        else:
+            print(f'WARNING: output is {growth} bytes larger than input, '
+                  f'trailing bytes are NOT zero — not truncating')
+
+    out_path = Path(args.out) if args.out else path.with_suffix(path.suffix + '.signed')
+    out_path.write_bytes(out_bytes)
+    print('Write complete:', out_path)
+
+
+def main():
+    p = argparse.ArgumentParser(description='MTK CERT2 hash extractor and updater')
+    p.add_argument('image', help='input image file')
+    p.add_argument('-w', '--write', action='store_true', help='write updated image')
+    p.add_argument('-o', '--out', help='output file (default: <input>.signed)')
+    p.add_argument('--legacy', action='store_true',
+                   help='prepend BITSTRING(original CERT2 DER) for old libsec bypass_mode=1')
+    args = p.parse_args()
+
+    path = Path(args.image)
+    if not path.exists():
+        print('File not found:', path)
+        sys.exit(2)
+    data = path.read_bytes()
+    print(f"Name: {path.name}  Size: {len(data)}")
+
+    parts = parse_part_headers(data)
+    if parts:
+        sign_normal_image(data, args, path)
+    else:
+        print('No part_hdr_t at file start, trying headerless mode...')
+        sign_headerless_image(data, args, path)
 
 
 if __name__ == '__main__':
