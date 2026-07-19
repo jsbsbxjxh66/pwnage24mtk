@@ -80,7 +80,7 @@ bl2_ext 本身由 preloader 通过 CERT2 验证。bl2_ext 内部**可能**有独
 
 ---
 
-## 操作流程：修改 LK 并刷入（V5 设备）
+## 操作流程：修改 LK 并刷入
 
 以下假设你的 `lk.img` 是 MKIMG 复合镜像（包含 lk + cert 等子镜像）。
 
@@ -173,9 +173,9 @@ python3 verify_mtk_image.py lk_final.img
 ```
 
 输出中关注：
-- `Image Header Hash`: orig 和 calc 应该不同（因为你改了数据），但 `override` 应匹配 calc
-- `Image Hash`: 同上
-- CERT2 RSA 签名：应显示 PASS（原始签名未变，覆盖块不影响签名验证）
+- `Image header hash`: 显示 OK（override 哈希与当前数据匹配）
+- `Image data hash`: 显示 OK
+- `CERT2 signature`: 显示 OK（原始签名未变，覆盖块不影响签名验证）
 
 ### 7. 刷入
 
@@ -301,22 +301,22 @@ python3 parse_preloader.py preloader.bin
 
 ## 各平台 lk.img 结构差异
 
-| 类型 | 版本 | 子镜像 | 第二设备树 |
-|------|------|--------|-----------|
-| V5 | V5 | lk, lk_main_dtb | 无 |
-| V6 | V6 | lk, bl2_ext, aee, lk_main_dtb | **特殊**：无 part_hdr_t，存储在主列表之后 |
-| V6+AVF | V6 | lk, bl2_ext, aee, lk_main_dtb, lk_dtbo | 标准格式：有 part_hdr_t |
+| 类型 | 子镜像 | 第二设备树 |
+|------|--------|-----------|
+| V5 | lk, lk_main_dtb | 无 |
+| V6 | lk, bl2_ext, aee, lk_main_dtb | **特殊**：无 part_hdr_t，存储在主列表之后（带 cert1+cert2） |
+| V6+AVF | lk, bl2_ext, aee, lk_main_dtb, lk_dtbo | 标准格式：有 part_hdr_t |
 
 ### Headerless 第二设备树（部分 V6 设备）
 
-部分 V6 设备的 lk.img 中，`lk_main_dtb` 的 cert2 设置了 `img_list_end=1` 终止镜像列表。但在列表结束后还存储了第二设备树：
+部分 V6 设备的 lk.img 中，`lk_main_dtb` 的 cert2 设置了 `img_list_end=1` 终止镜像列表。但在列表结束后还存储了第二设备树（带独立的 cert1 + cert2）：
 
 ```
 [主镜像列表: lk + bl2_ext + aee + lk_main_dtb（各带 cert1/cert2）]
-[零填充至 4K 页对齐]
-[第二设备树原始数据（无 part_hdr_t）]
-[cert1]
-[cert2 (img_list_end=1)]
+[零填充至页对齐]
+[第二设备树原始数据（无 part_hdr_t，直接是 DTB）]
+[cert1 (有 part_hdr_t)]
+[cert2 (有 part_hdr_t, img_list_end=1)]
 [零填充至分区结尾]
 ```
 
@@ -421,4 +421,5 @@ python3 verify_mtk_image.py lk_final.img
 2. **镜像大小**。cert bypass 会增大 CERT2 的 dsize，脚本会自动截断尾部零填充保持原始大小。如果尾部无零填充会发出警告。重建后需要 pad 到原始分区大小
 3. **漏洞时效性**。此漏洞可能在新版 preloader 中已修复。如果 CERT2 bypass 失败，可能说明设备已更新
 4. **V6 设备**。有 bl2_ext 的设备**可能**需要 patch bl2_ext 去除二次验证。先只做 cert bypass 测试，失败再 patch。用 `parse_preloader.py` 确认是否有 bl2_ext
-5. **Preloader 本身**。修改 preloader 需要 Image Key 私钥做 PSS 重签名。cert bypass 只适用于 preloader 验证的下游镜像（LK/ATF/TEE/GZ）
+5. **Bootloader 已解锁的设备**。部分设备解锁 bootloader 后 bl2_ext 不再验证子镜像，此时只需 cert bypass 签名修改过的子镜像即可，无需 patch bl2_ext
+6. **Preloader 本身**。修改 preloader 需要 Image Key 私钥做 PSS 重签名。cert bypass 只适用于 preloader 验证的下游镜像（LK/ATF/TEE/GZ）
