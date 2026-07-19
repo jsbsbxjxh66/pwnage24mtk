@@ -192,7 +192,22 @@ fastboot flash lk lk_final.img
 
 ## 操作流程：修改 ATF/TEE（V5/V6 设备）
 
-ATF 通常打包在 `tee1.img` 内，也是 MKIMG 复合镜像。流程和 LK 一样：
+ATF 通常打包在 `tee1.img` 内，也是 MKIMG 复合镜像。
+
+### 快速方式（直接对完整镜像操作）
+
+```bash
+# 1. 修改（用十六进制编辑器或 patch 工具直接改 tee1.img 中的 ATF 代码）
+
+# 2. 一次性重签所有子镜像
+python3 sign_mtk_cert.py -w --all tee1.img -o tee1_signed.img
+
+# 3. 验证 + 刷入
+python3 verify_mtk_image.py tee1_signed.img
+fastboot flash tee1 tee1_signed.img
+```
+
+### 拆分方式（需要精确修改某个子镜像时）
 
 ```bash
 # 1. 查看结构
@@ -201,19 +216,14 @@ python3 parse-part-img.py tee1.img --dump
 # 2. 拆分
 python3 parse-part-img.py tee1.img --split -o tee_parts/
 
-# 3. 修改 tee_parts/tee1.bin（偏移 512 之后是 ATF 代码）
+# 3. 修改 tee_parts/atf.bin 或 tee_parts/tee.bin（偏移 512 之后是代码）
 
-# 4. cert bypass 签名（直接对拆分文件）
-python3 sign_mtk_cert.py -w tee_parts/tee1.bin -o tee_parts/tee1_signed.bin
+# 4. 一键重签 + 打包
+python3 build-part-img.py rebuild tee_parts/ -o tee1_final.img
 
-# 5. 重建（单个子镜像直接用，多个子镜像用 concat）
-python3 build-part-img.py concat tee_parts/ --order tee1 -o tee_final.img
-
-# 6. 验证
-python3 verify_mtk_image.py tee_final.img
-
-# 7. 刷入
-fastboot flash tee1 tee_final.img
+# 5. 验证 + 刷入
+python3 verify_mtk_image.py tee1_final.img
+fastboot flash tee1 tee1_final.img
 ```
 
 ---
